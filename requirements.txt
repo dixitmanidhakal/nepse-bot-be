@@ -10,6 +10,7 @@ alembic==1.14.0               # Database migration tool (Python 3.13 compatible)
 # Data Processing
 pandas==2.2.3                 # Data manipulation and analysis (Python 3.13 compatible)
 numpy==2.2.1                  # Numerical computing (Python 3.13 compatible)
+scipy>=1.13.0                 # Scientific computing (argrelextrema for support/resistance)
 
 # Technical Analysis
 # TA-Lib==0.4.28              # Technical analysis library - COMMENTED OUT
@@ -42,3 +43,7 @@ pytest-cov==6.0.0             # Coverage plugin for pytest (Python 3.13 compatib
 # Utilities
 python-dateutil==2.9.0        # Extensions to the standard datetime module
 pytz==2024.2                  # Timezone definitions
+
+# NEPSE Unofficial API (market depth, live market, floorsheet)
+# Pinned to the commit used by nepse-quant-terminal for compatibility
+nepse @ git+https://github.com/basic-bgnr/NepseUnofficialApi.git@2f09fbfdcbaf23545d5755b6f11b367324d5b8a4

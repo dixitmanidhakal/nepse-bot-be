@@ -39,7 +39,12 @@ ENV/
 
 # Database
 *.db
+*.sqlite
 *.sqlite3
+
+# Runtime cache dir (raw scraper payloads) — anchor to repo root so we
+# don't accidentally ignore `app/services/data/`.
+/data/
 
 # Logs
 *.log

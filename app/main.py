@@ -11,9 +11,11 @@ Architecture Benefits:
 - Health check endpoints for monitoring
 """
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy.orm import Session
 import logging
 from contextlib import asynccontextmanager
@@ -353,17 +355,41 @@ async def get_configuration():
     }
 
 
-# Error handler for 404
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
-    """Handle 404 errors"""
-    return JSONResponse(
-        status_code=404,
-        content={
+# Unified HTTPException handler — respects the `detail` message set by routes
+# (e.g. "No market depth data found for NABIL") and only substitutes a generic
+# "Endpoint not found" message when FastAPI itself raises 404 for an unmatched
+# route (which has detail == "Not Found").
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc: StarletteHTTPException):
+    detail = exc.detail
+    is_default_not_found = exc.status_code == 404 and detail == "Not Found"
+
+    if is_default_not_found:
+        payload = {
             "status": "error",
             "message": "Endpoint not found",
-            "path": str(request.url)
+            "path": str(request.url),
         }
+    elif isinstance(detail, dict):
+        payload = {"status": "error", **detail}
+    else:
+        payload = {
+            "status": "error",
+            "message": str(detail) if detail is not None else "Request failed",
+        }
+
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "error",
+            "message": "Validation failed",
+            "errors": exc.errors(),
+        },
     )
 
 

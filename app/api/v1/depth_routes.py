@@ -18,10 +18,71 @@ import logging
 
 from app.database import get_db
 from app.components.market_depth_analyzer import MarketDepthAnalyzer
+from app.services.data.market_depth_service import MarketDepthService
+from app.services.http import (
+    CircuitBreakerOpen,
+    RateLimitExceeded,
+    UpstreamUnavailable,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/depth", tags=["Market Depth"])
+
+
+# Per-exception hint for upstream failures — keeps the dispatch table below
+# declarative instead of a stack of near-duplicate `except` clauses.
+_UPSTREAM_HINTS: dict[type[Exception], tuple[str, str]] = {
+    UpstreamUnavailable: (
+        "All market depth sources unavailable",
+        "NEPSE depth endpoints are geo-restricted to Nepal. Configure "
+        "SCRAPER_PROXIES with a Nepal proxy or deploy the server in Nepal.",
+    ),
+    CircuitBreakerOpen: (
+        "Depth source circuit breaker open",
+        "Too many consecutive upstream failures; try again after the cool-down.",
+    ),
+    RateLimitExceeded: (
+        "Depth source rate-limit exhausted",
+        "The anti-ban layer is protecting the upstream — retry in a few seconds.",
+    ),
+}
+
+
+def _ensure_depth_available(db: Session, symbol: str) -> None:
+    """
+    If the DB has no market depth for ``symbol``, trigger a live fetch via
+    :class:`MarketDepthService` (which internally uses the resilient
+    multi-source fallback chain). On hard failure raise HTTPException(503)
+    with a descriptive detail so the API client knows the reason.
+    """
+    analyzer = MarketDepthAnalyzer(db)
+    if analyzer.get_current_depth(symbol) is not None:
+        return
+
+    logger.info("No cached depth for %s — triggering live fetch", symbol)
+
+    try:
+        response = MarketDepthService(db).fetch_and_store_market_depth(symbol)
+    except tuple(_UPSTREAM_HINTS) as exc:
+        title, hint = _UPSTREAM_HINTS[type(exc)]
+        raise HTTPException(
+            status_code=503,
+            detail={"message": title, "symbol": symbol,
+                    "reason": str(exc), "hint": hint},
+        ) from exc
+
+    if response.status != "success":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Market depth upstream refused",
+                "symbol": symbol,
+                "reason": response.message,
+                "hint": "Try again shortly — depth sources are "
+                        "rate-limited or temporarily unavailable.",
+            },
+        )
 
 
 @router.get("/{symbol}/current")
@@ -40,20 +101,20 @@ async def get_current_depth(
     - Liquidity metrics
     """
     try:
+        _ensure_depth_available(db, symbol)
+
         analyzer = MarketDepthAnalyzer(db)
         result = analyzer.get_current_depth(symbol)
-        
+
         if result is None:
+            # Shouldn't happen after _ensure_depth_available — defensive
             raise HTTPException(
                 status_code=404,
-                detail=f"No market depth data found for {symbol}"
+                detail=f"No market depth data found for {symbol}",
             )
-        
-        return {
-            "success": True,
-            "data": result
-        }
-        
+
+        return {"success": True, "data": result}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -77,22 +138,23 @@ async def get_depth_analysis(
     - Support/Resistance from order book
     """
     try:
+        _ensure_depth_available(db, symbol)
+
         analyzer = MarketDepthAnalyzer(db)
-        
+
         result = {
             "symbol": symbol,
             "imbalance": analyzer.analyze_order_imbalance(symbol),
             "walls": analyzer.detect_walls(symbol),
             "liquidity": analyzer.analyze_liquidity(symbol),
             "pressure": analyzer.calculate_price_pressure(symbol),
-            "support_resistance": analyzer.get_support_resistance_from_depth(symbol)
+            "support_resistance": analyzer.get_support_resistance_from_depth(symbol),
         }
-        
-        return {
-            "success": True,
-            "data": result
-        }
-        
+
+        return {"success": True, "data": result}
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error analyzing depth for {symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -281,6 +343,91 @@ async def get_depth_history(
     except Exception as e:
         logger.error(f"Error getting depth history for {symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/seed")
+async def seed_market_depth(
+    limit: int = Query(50, ge=1, le=500, description="Max symbols to seed"),
+    symbols: Optional[str] = Query(
+        None,
+        description="Comma-separated symbols. If omitted, the most active "
+                    "`limit` stocks are seeded.",
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk populate the market_depth table using the live fallback chain.
+
+    Intended to be called once after startup (or on a scheduler) so that
+    the UI has data to show immediately. Requests are paced by the
+    resilient HTTP client's rate limiter — the anti-ban layer guarantees
+    we never hammer upstream.
+
+    Returns a per-symbol status map.
+    """
+    from app.models.stock import Stock
+
+    if symbols:
+        target = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        rows = (
+            db.query(Stock.symbol)
+            .filter(Stock.is_active.is_(True) if hasattr(Stock, "is_active") else True)
+            .order_by(Stock.id.asc())
+            .limit(limit)
+            .all()
+        )
+        target = [r[0] for r in rows]
+
+    if not target:
+        raise HTTPException(status_code=400, detail="No symbols to seed")
+
+    service = MarketDepthService(db)
+    results = {"success": 0, "failed": 0, "skipped": 0, "details": []}
+
+    for sym in target:
+        try:
+            response = service.fetch_and_store_market_depth(sym)
+            if response.status == "success":
+                results["success"] += 1
+                results["details"].append({"symbol": sym, "status": "ok"})
+            else:
+                results["failed"] += 1
+                results["details"].append({
+                    "symbol": sym,
+                    "status": "error",
+                    "message": response.message,
+                })
+        except CircuitBreakerOpen:
+            # stop the whole batch — respect the breaker
+            results["skipped"] += len(target) - (results["success"] + results["failed"])
+            results["details"].append({
+                "symbol": sym,
+                "status": "skipped",
+                "message": "circuit breaker open — aborting batch",
+            })
+            break
+        except Exception as exc:  # pragma: no cover
+            results["failed"] += 1
+            results["details"].append({
+                "symbol": sym,
+                "status": "error",
+                "message": str(exc),
+            })
+
+    status_code = 200 if results["success"] > 0 else 503
+    if status_code == 503:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Unable to seed any market depth",
+                "results": results,
+                "hint": "Upstream is geo-restricted or unreachable. "
+                        "Configure SCRAPER_PROXIES or run from Nepal.",
+            },
+        )
+
+    return {"success": True, "seeded": results["success"], "results": results}
 
 
 @router.get("/{symbol}/support-resistance")

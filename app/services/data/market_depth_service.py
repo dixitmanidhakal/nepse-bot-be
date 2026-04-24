@@ -10,10 +10,24 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.services.nepse_api_client import create_api_client
+from app.services.data.depth_sources import fetch_market_depth as _fetch_real_depth
+from app.services.http import (
+    CircuitBreakerOpen,
+    RateLimitExceeded,
+    UpstreamUnavailable,
+)
 from app.models.stock import Stock
 from app.models.market_depth import MarketDepth
 from app.validators.depth_validators import MarketDepthSchema, MarketDepthResponse
+
+# Exceptions that the caller (route layer) maps to HTTP 503 with a specific
+# hint. We propagate them instead of wrapping in a status="error" response
+# so the route can show users an actionable reason.
+_PROPAGATED_UPSTREAM_ERRORS = (
+    UpstreamUnavailable,
+    CircuitBreakerOpen,
+    RateLimitExceeded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +46,11 @@ class MarketDepthService:
     def __init__(self, db: Session):
         """
         Initialize market depth service
-        
+
         Args:
             db: Database session
         """
         self.db = db
-        self.api_client = create_api_client("nepse")
         logger.info("MarketDepthService initialized")
     
     def fetch_and_store_market_depth(self, symbol: str) -> MarketDepthResponse:
@@ -64,17 +77,12 @@ class MarketDepthService:
                     errors=[f"Stock not found: {symbol}"]
                 )
             
-            # Fetch data from API
-            depth_data = self.api_client.fetch_market_depth(symbol)
-            
-            if "error" in depth_data:
-                logger.error(f"Error fetching market depth: {depth_data['error']}")
-                return MarketDepthResponse(
-                    status="error",
-                    message=f"Failed to fetch market depth: {depth_data['error']}",
-                    symbol=symbol,
-                    errors=[depth_data['error']]
-                )
+            # Fetch data via resilient multi-source chain. Anti-ban errors
+            # (upstream unavailable / circuit open / rate-limited) are
+            # propagated so the route layer can return a 503 with a
+            # user-actionable hint; other errors fall through to the
+            # generic `except` below.
+            depth_data = _fetch_real_depth(symbol)
             
             # Validate market depth data
             validated_data = self._validate_market_depth(symbol, depth_data)
@@ -102,6 +110,10 @@ class MarketDepthService:
                 depth_data=validated_data
             )
             
+        except _PROPAGATED_UPSTREAM_ERRORS:
+            # Route layer will translate this into a 503 with a specific hint.
+            self.db.rollback()
+            raise
         except Exception as e:
             logger.error(f"Error in fetch_and_store_market_depth: {e}")
             self.db.rollback()
@@ -111,8 +123,6 @@ class MarketDepthService:
                 symbol=symbol,
                 errors=[str(e)]
             )
-        finally:
-            self.api_client.close()
     
     def _validate_market_depth(self, symbol: str, data: Dict[str, Any]) -> Optional[MarketDepthSchema]:
         """
@@ -275,8 +285,10 @@ class MarketDepthService:
                 order_imbalance=depth_data.order_imbalance,
                 bid_ask_spread=depth_data.bid_ask_spread,
                 bid_ask_spread_percent=depth_data.bid_ask_spread_percent,
-                has_bid_wall=depth_data.has_bid_wall,
-                has_ask_wall=depth_data.has_ask_wall
+                # DB column is Integer (0/1) for index friendliness; coerce
+                # the pydantic bool flag to int before writing.
+                has_bid_wall=int(bool(depth_data.has_bid_wall)),
+                has_ask_wall=int(bool(depth_data.has_ask_wall)),
             )
             
             self.db.add(depth)
