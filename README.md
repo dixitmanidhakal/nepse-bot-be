@@ -24,6 +24,33 @@ Before you begin, ensure you have the following installed:
   - Ubuntu: `sudo apt-get install ta-lib`
   - Windows: [Download from here](https://github.com/mrjbq7/ta-lib#windows)
 
+## ⚡ One-command runner
+
+```bash
+./run.sh                 # macOS / Linux (auto-creates venv + installs deps)
+run.bat                  # Windows
+```
+
+After that, browse to:
+
+- API root : http://localhost:8000
+- Swagger  : http://localhost:8000/docs
+- ReDoc    : http://localhost:8000/redoc
+
+Environment overrides:
+
+| Env var   | Default   | Purpose                            |
+| --------- | --------- | ---------------------------------- |
+| `HOST`    | `0.0.0.0` | Bind address                       |
+| `PORT`    | `8000`    | Bind port                          |
+| `RELOAD`  | `0`       | Set to `1` for uvicorn `--reload`  |
+
+### Run the test suite
+
+```bash
+./venv/bin/pytest        # 71 tests (unit + api + integration)
+```
+
 ## 🚀 Quick Start
 
 ### 1. Clone the Repository
