@@ -21,7 +21,8 @@ in try/except and will gracefully degrade rather than raise.
 from __future__ import annotations
 
 import logging
-from datetime import date
+import math
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from . import yonepse, samirwagle
@@ -124,6 +125,250 @@ async def symbol_prices(symbol: str) -> List[Dict[str, Any]]:
     # Could fall back to SQLite here; left to the existing historical_provider
     # consumer rather than duplicate logic.
     return []
+
+
+async def symbol_prices_enriched(symbol: str) -> List[Dict[str, Any]]:
+    """
+    Same as `symbol_prices` but **prepends today's live bar** (synthesized from
+    the live quote snapshot) when it is fresher than the latest historical row.
+
+    Upstream yonepse / samirwagle per-symbol CSVs can lag the live market by
+    several days or weeks. Merging the live snapshot in here fixes:
+      * empty / truncated charts on StockAnalysis,
+      * wrong "last close" used by indicators & recommendations,
+      * stale % change in screeners.
+    """
+    rows = await samirwagle.get_symbol_prices(symbol)
+    try:
+        live = await yonepse.get_live_market_by_symbol(symbol)
+    except Exception:  # noqa: BLE001
+        live = None
+
+    if not live:
+        return rows or []
+
+    # Determine the live bar's "date"
+    last_updated = live.get("last_updated")
+    if isinstance(last_updated, str):
+        try:
+            # handles "2026-04-28T14:59:49.693975" / with Z
+            dt = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    live_date = dt.date().isoformat()
+
+    latest_hist_date = rows[0].get("date") if rows else None
+    if latest_hist_date and str(latest_hist_date) >= live_date:
+        # history already has today (or newer) — nothing to prepend
+        return rows
+
+    ltp = _safe_float(live.get("ltp"))
+    high = _safe_float(live.get("high"), default=ltp)
+    low = _safe_float(live.get("low"), default=ltp)
+    prev_close = _safe_float(live.get("previous_close"), default=ltp)
+    open_px = prev_close if prev_close > 0 else ltp
+    pct = _safe_float(live.get("percent_change"), default=0.0)
+    qty = int(_safe_float(live.get("volume"), default=0))
+    turnover = _safe_float(live.get("turnover"), default=0.0)
+
+    synthesized = {
+        "date": live_date,
+        "open": round(open_px, 2),
+        "high": round(high, 2),
+        "low": round(low, 2),
+        "ltp": round(ltp, 2),
+        "close": round(ltp, 2),  # alias commonly expected by analytics
+        "percent_change": round(pct, 2),
+        "qty": qty,
+        "volume": qty,  # alias
+        "turnover": round(turnover, 2),
+        "source": "live_snapshot",
+    }
+
+    return [synthesized] + list(rows or [])
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except Exception:  # noqa: BLE001
+        return default
+
+
+# -------------------------- sector drill-down --------------------------
+
+def _normalize_sector(name: str) -> str:
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+async def sector_stocks(sector_name: str) -> List[Dict[str, Any]]:
+    """
+    Return live snapshot rows for every symbol that belongs to the given
+    sector. Sector classification comes from the yonepse 'securities' master
+    (each row has a `sector` field); we join it to the live snapshot by
+    symbol.
+    """
+    wanted = _normalize_sector(sector_name)
+    if not wanted:
+        return []
+
+    try:
+        securities = await yonepse.get_all_securities()
+    except Exception:  # noqa: BLE001
+        securities = []
+
+    symbol_to_sector: Dict[str, str] = {}
+    for s in securities or []:
+        sym = (s.get("symbol") or s.get("ticker") or "").upper()
+        sec = s.get("sector") or s.get("sector_name") or ""
+        if sym:
+            symbol_to_sector[sym] = sec
+
+    try:
+        live = await yonepse.get_live_market()
+    except Exception:  # noqa: BLE001
+        live = []
+
+    matches: List[Dict[str, Any]] = []
+    for row in live or []:
+        sym = (row.get("symbol") or "").upper()
+        sec = symbol_to_sector.get(sym, "")
+        if _normalize_sector(sec) == wanted:
+            matches.append({**row, "sector": sec})
+
+    # sort by turnover desc so the UI shows biggest movers first
+    matches.sort(key=lambda r: _safe_float(r.get("turnover"), 0.0), reverse=True)
+    return matches
+
+
+# -------------------------- live-scored recommendations --------------------------
+
+def _recommend_from_live(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """
+    Score the live snapshot on a composite of momentum (today %change),
+    volume participation (turnover rank) and intraday strength.
+
+    This is a deliberately simple, transparent scorer that is fresh every
+    request and does not depend on any historical source.
+    """
+    if not rows:
+        return []
+
+    # normalize turnover to 0..1 rank
+    turnovers = sorted(
+        [_safe_float(r.get("turnover")) for r in rows], reverse=True
+    )
+    total_turnover = sum(turnovers) or 1.0
+    rank_lookup: Dict[str, float] = {}
+    for r in rows:
+        t = _safe_float(r.get("turnover"))
+        rank_lookup[(r.get("symbol") or "").upper()] = t / total_turnover
+
+    scored: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = (r.get("symbol") or "").upper()
+        ltp = _safe_float(r.get("ltp"))
+        pct = _safe_float(r.get("percent_change"))
+        high = _safe_float(r.get("high"), default=ltp)
+        low = _safe_float(r.get("low"), default=ltp)
+        prev = _safe_float(r.get("previous_close"), default=ltp)
+        volume = _safe_float(r.get("volume"))
+        turnover = _safe_float(r.get("turnover"))
+
+        # momentum: clipped % change → -1..+1
+        momentum = max(-10.0, min(10.0, pct)) / 10.0
+        # position-in-range (close vs day range) → 0..1
+        pos = 0.5
+        if high > low:
+            pos = max(0.0, min(1.0, (ltp - low) / (high - low)))
+        # turnover weight → 0..1
+        turn_weight = rank_lookup.get(sym, 0.0)
+        # final composite in 0..100
+        raw = (
+            0.45 * (momentum * 0.5 + 0.5)   # 0..1
+            + 0.30 * pos                     # 0..1
+            + 0.25 * min(1.0, turn_weight * 20.0)
+        )
+        score = round(raw * 100.0, 2)
+
+        if momentum > 0.2 and pos > 0.55:
+            action = "BUY"
+        elif momentum < -0.25 and pos < 0.4:
+            action = "AVOID"
+        else:
+            action = "WATCH"
+
+        rationale: List[str] = []
+        if pct > 0:
+            rationale.append(f"Today +{pct:.2f}%")
+        elif pct < 0:
+            rationale.append(f"Today {pct:.2f}%")
+        if pos > 0.7:
+            rationale.append("Trading near day-high (strong close)")
+        elif pos < 0.3:
+            rationale.append("Trading near day-low (weak close)")
+        if turnover > 0:
+            rationale.append(f"Turnover: NPR {turnover:,.0f}")
+
+        scored.append({
+            "symbol": sym,
+            "action": action,
+            "score": score,
+            "last_close": ltp,
+            "change_1d_pct": pct,
+            "change_5d_pct": None,
+            "change_20d_pct": None,
+            "rsi_14": None,
+            "macd_hist": None,
+            "volume_ratio": None,
+            "volatility_annualised": None,
+            "drawdown_from_high_pct": round((ltp - high) / high * 100.0, 2)
+            if high > 0 else None,
+            "factor_scores": {
+                "trend": round(momentum * 0.5 + 0.5, 3),
+                "momentum": round(momentum, 3),
+                "volume": round(min(1.0, turn_weight * 20.0), 3),
+                "volatility": round(pos, 3),
+                "drawdown": round(1.0 - min(1.0, abs(prev - ltp) / max(prev, 1.0)), 3),
+            },
+            "rationale": rationale,
+            "as_of_date": datetime.now(timezone.utc).date().isoformat(),
+            "live_volume": volume,
+            "live_turnover": turnover,
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:limit]
+
+
+async def recommendations_live(
+    limit: int = 50,
+    action: Optional[str] = None,
+    min_score: float = 0.0,
+) -> Dict[str, Any]:
+    """Compute recommendations from today's live snapshot."""
+    rows = await yonepse.get_live_market()
+    scored = _recommend_from_live(rows or [], limit=10_000)
+
+    if min_score > 0:
+        scored = [r for r in scored if r["score"] >= min_score]
+    if action:
+        scored = [r for r in scored if r["action"] == action.upper()]
+
+    return {
+        "status": "success",
+        "count": min(limit, len(scored)),
+        "universe_size": len(rows or []),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "data": scored[:limit],
+    }
 
 
 async def symbol_dividends(symbol: str) -> List[Dict[str, Any]]:

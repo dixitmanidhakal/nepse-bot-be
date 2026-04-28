@@ -80,6 +80,22 @@ async def sector_indices():
     return await aggregator.sector_indices()
 
 
+@router.get("/indices/sectors/{sector}/stocks")
+async def sector_stocks(sector: str):
+    """
+    Return live-snapshot rows for every symbol belonging to `sector`.
+
+    Used by the SectorAnalysis page to show the constituent stocks of a
+    selected sector with today's fresh prices/volume/turnover.
+    """
+    rows = await aggregator.sector_stocks(sector)
+    return {
+        "sector": sector,
+        "count": len(rows),
+        "data": rows,
+    }
+
+
 # ---------- depth ----------
 
 @router.get("/depth/{symbol}")
@@ -135,8 +151,20 @@ async def floorsheet_by_date(
 async def symbol_prices(
     symbol: str,
     limit: int = Query(500, ge=1, le=10_000),
+    enriched: bool = Query(
+        True,
+        description=(
+            "When true (default), prepend today's live bar from the live "
+            "quote snapshot if it is fresher than the historical CSV. "
+            "Fixes stale charts when the upstream scraper lags."
+        ),
+    ),
 ):
-    rows = await aggregator.symbol_prices(symbol)
+    rows = (
+        await aggregator.symbol_prices_enriched(symbol)
+        if enriched
+        else await aggregator.symbol_prices(symbol)
+    )
     return {
         "symbol": symbol.upper(),
         "total": len(rows),
@@ -186,3 +214,43 @@ async def notices():
 @router.get("/dps")
 async def dps():
     return await aggregator.dps()
+
+
+# ---------- live-scored recommendations ----------
+
+@router.get("/recommendations/top")
+async def recommendations_top(
+    limit: int = Query(30, ge=1, le=500),
+    action: Optional[str] = Query(
+        None, pattern="^(BUY|WATCH|AVOID)$", description="Filter by action"
+    ),
+    min_score: float = Query(0.0, ge=0.0, le=100.0),
+):
+    """
+    Fresh recommendations computed from today's live snapshot.
+
+    Unlike `/api/v1/recommendations/top` (which scores against the bundled
+    SQLite history that can be days/weeks old on a free-tier deploy), this
+    endpoint recomputes scores every request from the live yonepse snapshot,
+    so it always reflects today's market action.
+    """
+    return await aggregator.recommendations_live(
+        limit=limit, action=action, min_score=min_score
+    )
+
+
+@router.get("/recommendations/universe")
+async def recommendations_universe():
+    rows = await aggregator.live_market()
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    return {
+        "status": "success",
+        "data": {
+            "total_symbols": len(rows),
+            "total_rows": len(rows),
+            "earliest_date": today,
+            "latest_date": today,
+            "db_path": "free-provider:live-snapshot",
+        },
+    }
