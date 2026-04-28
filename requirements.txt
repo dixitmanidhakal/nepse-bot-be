@@ -11,6 +11,7 @@ alembic==1.14.0               # Database migration tool (Python 3.13 compatible)
 pandas==2.2.3                 # Data manipulation and analysis (Python 3.13 compatible)
 numpy==2.2.1                  # Numerical computing (Python 3.13 compatible)
 scipy>=1.13.0                 # Scientific computing (argrelextrema for support/resistance)
+hmmlearn>=0.3.0               # Gaussian HMM for regime detection (imported lazily)
 
 # Technical Analysis
 # TA-Lib==0.4.28              # Technical analysis library - COMMENTED OUT

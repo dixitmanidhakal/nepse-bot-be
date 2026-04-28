@@ -54,22 +54,26 @@ class SectorAnalyzer:
                 }
             
             sector_analysis = []
-            
+
             for sector in sectors:
                 analysis = self.analyze_sector(sector.id)
                 if analysis['success']:
                     sector_analysis.append(analysis['data'])
-            
-            # Sort by 30-day momentum
-            sector_analysis.sort(key=lambda x: x.get('momentum_30d', 0), reverse=True)
-            
+
+            # Sort by 30-day momentum (treat NULL DB values as 0 so sort doesn't
+            # TypeError on mixed None/float comparisons)
+            def _m30(x):
+                v = x.get('momentum_30d')
+                return float(v) if v is not None else 0.0
+            sector_analysis.sort(key=_m30, reverse=True)
+
             # Add ranks
             for i, sector in enumerate(sector_analysis, 1):
                 sector['rank'] = i
-            
-            # Identify bullish and bearish sectors
-            bullish_sectors = [s for s in sector_analysis if s.get('momentum_30d', 0) > 5]
-            bearish_sectors = [s for s in sector_analysis if s.get('momentum_30d', 0) < -5]
+
+            # Identify bullish and bearish sectors (same None-safe coercion)
+            bullish_sectors = [s for s in sector_analysis if _m30(s) > 5]
+            bearish_sectors = [s for s in sector_analysis if _m30(s) < -5]
             
             return {
                 'success': True,
@@ -133,10 +137,16 @@ class SectorAnalyzer:
             else:
                 trend = 'neutral'
             
-            # Calculate average metrics
-            avg_change = np.mean([s.change_percent for s in stocks if s.change_percent]) if stocks else 0
-            avg_volume_ratio = np.mean([s.volume / s.avg_volume_30d for s in stocks 
-                                       if s.volume and s.avg_volume_30d and s.avg_volume_30d > 0]) if stocks else 0
+            # Calculate average metrics (guard against empty filtered lists
+            # which make np.mean return NaN → not JSON-serialisable)
+            change_values = [s.change_percent for s in stocks if s.change_percent]
+            avg_change = float(np.mean(change_values)) if change_values else 0.0
+
+            volume_ratios = [
+                s.volume / s.avg_volume_30d for s in stocks
+                if s.volume and s.avg_volume_30d and s.avg_volume_30d > 0
+            ]
+            avg_volume_ratio = float(np.mean(volume_ratios)) if volume_ratios else 0.0
             
             return {
                 'success': True,

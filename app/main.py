@@ -99,16 +99,34 @@ async def lifespan(app: FastAPI):
             logger.error(f"❌ NEPSE API connection failed: {e} (bot will use cached data)")
 
     asyncio.create_task(_probe_nepse_api())
-    
+
+    # Start high-frequency market-depth poller (runs only during NEPSE hours).
+    try:
+        from app.services.data.depth_poller import get_depth_poller, POLL_ENABLED
+        if POLL_ENABLED:
+            logger.info("Starting depth poller...")
+            await get_depth_poller().start()
+            logger.info("✅ Depth poller started (gated by NEPSE market hours)")
+        else:
+            logger.info("Depth poller disabled (DEPTH_POLLER_ENABLED=false)")
+    except Exception as e:
+        logger.error(f"❌ Failed to start depth poller: {e}")
+
     logger.info("=" * 60)
     logger.info(f"Application started successfully!")
     logger.info(f"API Documentation: http://{settings.host}:{settings.port}/docs")
     logger.info("=" * 60)
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down application...")
+    try:
+        from app.services.data.depth_poller import get_depth_poller
+        await get_depth_poller().stop()
+        logger.info("✅ Depth poller stopped")
+    except Exception as e:
+        logger.error(f"Depth poller shutdown error: {e}")
     logger.info("Application shutdown complete")
 
 
