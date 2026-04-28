@@ -34,10 +34,17 @@ def get_db_path() -> Optional[Path]:
     if not raw:
         return None
     p = Path(raw).expanduser()
-    if not p.exists():
-        logger.debug(f"Quant terminal DB not found at {p}")
-        return None
-    return p
+    if p.exists():
+        return p
+    # If a relative path was given, resolve it against the backend project root
+    # (parent of `app/`). This keeps local dev and Vercel deploys consistent.
+    if not p.is_absolute():
+        project_root = Path(__file__).resolve().parents[3]
+        candidate = (project_root / p).resolve()
+        if candidate.exists():
+            return candidate
+    logger.debug(f"Quant terminal DB not found at {p}")
+    return None
 
 
 def is_available() -> bool:

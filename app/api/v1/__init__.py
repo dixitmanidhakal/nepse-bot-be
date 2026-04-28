@@ -18,6 +18,7 @@ from app.api.v1 import (
     quant_advanced_routes,
     recommendation_routes,
     enhanced_recommendation_routes,
+    free_sources_routes,
 )
 
 # Create main v1 router
@@ -37,5 +38,6 @@ router.include_router(quant_routes.router)
 router.include_router(quant_advanced_routes.router)
 router.include_router(recommendation_routes.router)
 router.include_router(enhanced_recommendation_routes.router)
+router.include_router(free_sources_routes.router)
 
 __all__ = ["router"]

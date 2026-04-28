@@ -24,7 +24,8 @@ pydantic==2.10.6              # Data validation using Python type hints (Python 
 pydantic-settings==2.7.1      # Settings management for Pydantic (Python 3.13 compatible)
 
 # HTTP Client
-httpx==0.28.1                 # Async HTTP client for API calls (Python 3.13 compatible)
+# Pinned to match nepse package requirement (httpx[http2]==0.27.2)
+httpx[http2]==0.27.2          # Async HTTP client for API calls
 requests==2.32.3              # Synchronous HTTP library (Python 3.13 compatible)
 tenacity==9.1.2               # Retry library for handling transient failures
 

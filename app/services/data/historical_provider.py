@@ -78,7 +78,16 @@ class HistoricalDataProvider:
         if not self._configured_path:
             return None
         p = Path(self._configured_path).expanduser()
-        return p if p.exists() else None
+        if p.exists():
+            return p
+        # If a relative path was given (e.g. "data/nepse_data_public.db"),
+        # resolve it against the backend project root (parent of `app/`).
+        if not p.is_absolute():
+            project_root = Path(__file__).resolve().parents[3]
+            candidate = (project_root / p).resolve()
+            if candidate.exists():
+                return candidate
+        return None
 
     def is_available(self) -> bool:
         return self.db_path() is not None

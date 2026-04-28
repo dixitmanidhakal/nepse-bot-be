@@ -524,6 +524,221 @@ async def test_nepse_live():
     }
 
 
+# Data-persistence verification endpoint — confirms:
+#   1. Bundled SQLite historical DB is readable on every cold start (size, rows, latest date).
+#   2. Yonepse GitHub-Actions data is fresh (last_updated + commit timestamp).
+#   3. SamirWagle scraper is fresh (latest commit timestamp).
+@app.get("/__verify-data", tags=["Diagnostics"])
+async def verify_data():
+    import httpx
+    import asyncio
+    import sqlite3
+    import os
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    result: dict = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "sqlite": {},
+        "yonepse": {},
+        "samirwagle": {},
+    }
+
+    # 1. SQLite persistence check
+    try:
+        from app.services.data.quant_terminal_db import get_db_path
+        db_path = get_db_path()
+        if db_path is None:
+            result["sqlite"] = {"ok": False, "error": "DB path not resolved"}
+        else:
+            size_mb = round(db_path.stat().st_size / (1024 * 1024), 2)
+            uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            try:
+                row_count = conn.execute("SELECT COUNT(*) FROM stock_prices").fetchone()[0]
+                sym_count = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_prices").fetchone()[0]
+                min_d, max_d = conn.execute("SELECT MIN(date), MAX(date) FROM stock_prices").fetchone()
+            finally:
+                conn.close()
+            result["sqlite"] = {
+                "ok": True,
+                "path": str(db_path),
+                "size_mb": size_mb,
+                "row_count": row_count,
+                "symbol_count": sym_count,
+                "date_range": [str(min_d), str(max_d)],
+            }
+    except Exception as e:
+        result["sqlite"] = {"ok": False, "error": str(e)[:200]}
+
+    # 2. Yonepse + SamirWagle freshness (GitHub commits API + direct JSON)
+    headers = {"User-Agent": "nepse-bot/1.0"}
+
+    async def _probe_yonepse(client: httpx.AsyncClient):
+        # Latest commit time on main
+        try:
+            r = await client.get(
+                "https://api.github.com/repos/Shubhamnpk/yonepse/commits?per_page=1",
+                headers=headers,
+            )
+            if r.status_code == 200 and r.json():
+                commit = r.json()[0]["commit"]
+                result["yonepse"]["last_commit_utc"] = commit["committer"]["date"]
+                result["yonepse"]["last_commit_message"] = commit["message"][:120]
+        except Exception as e:
+            result["yonepse"]["commit_error"] = str(e)[:120]
+
+        # Actual data freshness + row counts
+        try:
+            r = await client.get(
+                "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/nepse_data.json",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and "data" in data:
+                    rows = data["data"]
+                    result["yonepse"]["nepse_data_last_updated"] = data.get("last_updated")
+                    result["yonepse"]["nepse_data_symbol_count"] = len(rows) if isinstance(rows, list) else None
+                elif isinstance(data, list):
+                    result["yonepse"]["nepse_data_symbol_count"] = len(data)
+                    result["yonepse"]["nepse_data_last_updated"] = None
+                result["yonepse"]["nepse_data_ok"] = True
+            else:
+                result["yonepse"]["nepse_data_ok"] = False
+                result["yonepse"]["nepse_data_status"] = r.status_code
+        except Exception as e:
+            result["yonepse"]["nepse_data_error"] = str(e)[:120]
+
+        try:
+            r = await client.get(
+                "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/market_status.json",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                result["yonepse"]["market_status"] = r.json()
+        except Exception as e:
+            result["yonepse"]["market_status_error"] = str(e)[:120]
+
+    async def _probe_samirwagle(client: httpx.AsyncClient):
+        try:
+            r = await client.get(
+                "https://api.github.com/repos/SamirWagle/Nepse-All-Scraper/commits?per_page=1",
+                headers=headers,
+            )
+            if r.status_code == 200 and r.json():
+                commit = r.json()[0]["commit"]
+                result["samirwagle"]["last_commit_utc"] = commit["committer"]["date"]
+                result["samirwagle"]["last_commit_message"] = commit["message"][:120]
+        except Exception as e:
+            result["samirwagle"]["commit_error"] = str(e)[:120]
+
+        try:
+            r = await client.get(
+                "https://raw.githubusercontent.com/SamirWagle/Nepse-All-Scraper/main/data/company_list.json",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                body = r.json()
+                result["samirwagle"]["company_list_count"] = (
+                    len(body) if isinstance(body, list) else None
+                )
+                result["samirwagle"]["company_list_ok"] = True
+        except Exception as e:
+            result["samirwagle"]["company_list_error"] = str(e)[:120]
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        await asyncio.gather(_probe_yonepse(client), _probe_samirwagle(client))
+
+    # Derive staleness flags
+    def _minutes_since(iso_str: str) -> float | None:
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return round((datetime.now(timezone.utc) - dt).total_seconds() / 60.0, 1)
+        except Exception:
+            return None
+
+    if "last_commit_utc" in result["yonepse"]:
+        result["yonepse"]["commit_age_minutes"] = _minutes_since(
+            result["yonepse"]["last_commit_utc"]
+        )
+    if "nepse_data_last_updated" in result["yonepse"] and result["yonepse"]["nepse_data_last_updated"]:
+        result["yonepse"]["data_age_minutes"] = _minutes_since(
+            result["yonepse"]["nepse_data_last_updated"]
+        )
+    if "last_commit_utc" in result["samirwagle"]:
+        result["samirwagle"]["commit_age_minutes"] = _minutes_since(
+            result["samirwagle"]["last_commit_utc"]
+        )
+
+    # Overall health summary
+    result["summary"] = {
+        "sqlite_persistent": result["sqlite"].get("ok", False),
+        "yonepse_reachable": result["yonepse"].get("nepse_data_ok", False),
+        "samirwagle_reachable": result["samirwagle"].get("company_list_ok", False),
+        "yonepse_fresh": (
+            (result["yonepse"].get("commit_age_minutes") or 99999) < 120
+        ),
+    }
+    return result
+
+
+# Diagnostic endpoint to probe which NEPSE data origins are reachable from
+# this runtime (useful to diagnose Vercel geo-block issues).
+@app.get("/__diagnose-upstream", tags=["Diagnostics"])
+async def diagnose_upstream():
+    import httpx
+    import asyncio
+    import time
+    targets = [
+        # Direct origins (most are geo-blocked)
+        ("nepalstock_api_summary","https://www.nepalstock.com.np/api/nots/market-open"),
+        ("merolagani_company",   "https://merolagani.com/CompanyDetail.aspx?symbol=NABIL"),
+        ("sharesansar_today",    "https://www.sharesansar.com/today-share-price"),
+        ("nepalipaisa_home",     "https://nepalipaisa.com/"),
+        # GitHub-Actions scraped datasets (free, reachable from Vercel)
+        ("gh_yonepse_nepse",     "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/nepse_data.json"),
+        ("gh_yonepse_indices",   "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/indices.json"),
+        ("gh_yonepse_top",       "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/top_stocks.json"),
+        ("gh_yonepse_market",    "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/market_summary.json"),
+        ("gh_yonepse_all_sec",   "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/all_securities.json"),
+        ("gh_yonepse_status",    "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/market_status.json"),
+        ("gh_samirwagle_list",   "https://raw.githubusercontent.com/SamirWagle/Nepse-All-Scraper/main/data/company_list.json"),
+        ("gh_samirwagle_adbl",   "https://raw.githubusercontent.com/SamirWagle/Nepse-All-Scraper/main/data/company-wise/ADBL/prices.csv"),
+        # Community-hosted NEPSE proxies (testing for depth availability)
+        ("prabesh_info",         "https://nepalstock-kj9g.onrender.com/info"),
+        ("prabesh_market_depth", "https://nepalstock-kj9g.onrender.com/api/nots/nepse-data/marketdepth/131"),
+        ("prabesh_summary",      "https://nepalstock-kj9g.onrender.com/api/nots/market/summary"),
+        ("prabesh_today_price",  "https://nepalstock-kj9g.onrender.com/api/nots/today-price"),
+        # CORS-proxy passthroughs (geography often preserved)
+        ("corsproxy_nepalstock", "https://corsproxy.io/?https://www.nepalstock.com.np/api/nots/market-open"),
+        ("codetabs_nepalstock",  "https://api.codetabs.com/v1/proxy?quest=https://www.nepalstock.com.np/api/nots/market-open"),
+        # Alternative scraped data sources with depth-like info
+        ("gh_yonepse_supply_demand", "https://raw.githubusercontent.com/Shubhamnpk/yonepse/main/data/supply_demand.json"),
+    ]
+    results = {}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; nepse-bot/1.0)"}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+        async def probe(label, url):
+            t0 = time.perf_counter()
+            try:
+                r = await client.get(url)
+                ms = round((time.perf_counter() - t0) * 1000, 1)
+                results[label] = {
+                    "url": url,
+                    "status": r.status_code,
+                    "ok": 200 <= r.status_code < 300,
+                    "ms": ms,
+                    "bytes": len(r.content),
+                    "content_type": r.headers.get("content-type", ""),
+                }
+            except Exception as e:
+                ms = round((time.perf_counter() - t0) * 1000, 1)
+                results[label] = {"url": url, "status": None, "ok": False, "ms": ms, "error": str(e)[:200]}
+        await asyncio.gather(*[probe(l, u) for l, u in targets])
+    return {"results": results}
+
+
 # Include API routers
 from app.api.v1 import router as api_v1_router
 app.include_router(api_v1_router, prefix="/api/v1")
