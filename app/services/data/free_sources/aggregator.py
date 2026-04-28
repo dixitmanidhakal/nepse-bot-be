@@ -227,7 +227,13 @@ async def sector_stocks(sector_name: str) -> List[Dict[str, Any]]:
     symbol_to_sector: Dict[str, str] = {}
     for s in securities or []:
         sym = (s.get("symbol") or s.get("ticker") or "").upper()
-        sec = s.get("sector") or s.get("sector_name") or ""
+        sec = (
+            s.get("sectorName")
+            or s.get("sector")
+            or s.get("sector_name")
+            or s.get("sectorDescription")
+            or ""
+        )
         if sym:
             symbol_to_sector[sym] = sec
 
